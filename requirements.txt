@@ -1,0 +1,15 @@
+
+torch
+torchvision
+numpy
+triton
+accelerate
+transformers
+datasets
+tqdm
+wandb
+Pillow
+matplotlib
+opencv-python
+timm
+decord
