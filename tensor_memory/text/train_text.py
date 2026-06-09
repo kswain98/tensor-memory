@@ -8,7 +8,8 @@ Datasets:
 Baselines (paper Table 1):
   - base         : Full causal attention Transformer
   - base_sln     : Base + post-attention LayerNorm ("Base + SLN" in the paper)
-  - local        : Sliding window attention (window=64)
+  - local        : Sliding window attention (window=64) + absolute position embeddings
+  - local_rope   : Sliding window attention (window=64) + RoPE (LLaMA/Mistral style)
   - xl           : Transformer-XL (segment recurrence, relative position bias)
   - linear       : Linear attention (ELU+1 kernel, simplified Performer)
 
@@ -44,6 +45,7 @@ import json
 import time
 import zipfile
 import argparse
+import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -53,6 +55,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------------------------
 # Weights & Biases (optional — graceful fallback if not installed)
 # ---------------------------------------------------------------------------
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    tqdm = None
+
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -563,34 +572,24 @@ class TransformerXL(nn.Module):
 
     def _rel_attn(self, q, k, v, layer_idx, S, M, device):
         """
-        Relative-position-biased attention.
+        Relative-position-biased attention via SDPA (fused softmax + matmul).
           q: [B, H, S, Dh]   (current segment queries)
           k: [B, H, M+S, Dh] (memory + current keys)
           v: [B, H, M+S, Dh]
         """
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, S, M+S]
-
-        # Relative position bias: query at position i, key at position j
-        # distance = (M + i) - j  (how far back the key is from the query)
-        # Ranges from 0 (self) to M+S-1 (oldest memory token from last query)
         total = M + S
-        qi_pos = torch.arange(M, M + S, device=device)          # [S]
-        kj_pos = torch.arange(0, total, device=device)           # [M+S]
-        dist = qi_pos.unsqueeze(1) - kj_pos.unsqueeze(0)         # [S, M+S]
-        dist = dist.clamp(0, self.rel_bias.size(1) - 1)
+        qi_pos = torch.arange(M, M + S, device=device)        # [S]
+        kj_pos = torch.arange(0, total, device=device)         # [M+S]
+        dist = (qi_pos.unsqueeze(1) - kj_pos.unsqueeze(0)).clamp(0, self.rel_bias.size(1) - 1)
 
-        bias = self.rel_bias[:, dist]                             # [H, S, M+S]
-        attn = attn + bias.unsqueeze(0)                           # broadcast B
-
-        # Causal mask: query i can attend to keys j where j <= M + i
+        # [1, H, S, M+S] additive bias — causal -inf baked in
+        bias = self.rel_bias[:, dist].unsqueeze(0)             # [1, H, S, M+S]
         causal = torch.arange(total, device=device).unsqueeze(0) > \
                  (torch.arange(S, device=device) + M).unsqueeze(1)  # [S, M+S]
-        attn = attn.masked_fill(causal.unsqueeze(0).unsqueeze(0), float('-inf'))
+        bias = bias.masked_fill(causal.unsqueeze(0).unsqueeze(0), float('-inf'))
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-        return torch.matmul(attn, v)                              # [B, H, S, Dh]
+        scale = self.head_dim ** -0.5
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=scale)
 
     def forward(self, x, use_memory=True):
         B, S = x.shape
@@ -699,6 +698,71 @@ class LinearAttentionTransformer(MiniTransformer):
         return self.head(self.ln(h))
 
 
+class RoPETransformer(MiniTransformer):
+    """Sliding-window Transformer with Rotary Position Embeddings (RoPE).
+
+    Replaces absolute position embeddings with RoPE applied to Q and K,
+    matching the position encoding used in LLaMA / Mistral.  Supports the
+    same sliding-window mask as `local` so the two are directly comparable.
+    Uses F.scaled_dot_product_attention (FlashAttention when is_causal=True).
+    """
+    def __init__(self, vocab, d=128, heads=4, layers=4, seq_len=256,
+                 window=None, dropout=0.1, tie_weights=True, sub_ln=False, **kwargs):
+        super().__init__(vocab, d, heads, layers, seq_len, window, dropout, tie_weights, sub_ln)
+        del self.pos                      # no absolute position embedding
+        self.head_dim = d // heads
+        theta = 10000.0
+        freqs = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        t = torch.arange(seq_len).float()
+        freqs = torch.outer(t, freqs)     # [seq_len, head_dim//2]
+        self.register_buffer('rope_cos', freqs.cos())
+        self.register_buffer('rope_sin', freqs.sin())
+
+    def _apply_rope(self, x, S):
+        """x: [B, H, S, Dh] — rotate Q or K with RoPE frequencies."""
+        cos = self.rope_cos[:S]           # [S, Dh//2]
+        sin = self.rope_sin[:S]
+        x1, x2 = x[..., :self.head_dim // 2], x[..., self.head_dim // 2:]
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+    def forward(self, x):
+        B, S = x.shape
+        h = self.embed_drop(self.tok(x))  # no absolute pos embed
+
+        if self.window is None:
+            sdpa_mask, sdpa_causal = None, True
+        else:
+            bool_mask = self._get_mask(S, x.device)   # [S, S] True=blocked
+            sdpa_mask = torch.zeros(S, S, device=x.device, dtype=torch.float32)
+            sdpa_mask.masked_fill_(bool_mask, float('-inf'))
+            sdpa_causal = False
+
+        for blk in self.blocks:
+            h2 = blk['ln1'](h)
+            proj = F.linear(h2, blk['attn'].in_proj_weight, blk['attn'].in_proj_bias)
+            q, k, v = proj.chunk(3, dim=-1)
+
+            q = q.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+            k = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+            v = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+
+            q = self._apply_rope(q, S)
+            k = self._apply_rope(k, S)
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=sdpa_mask, is_causal=sdpa_causal,
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d)
+            attn_out = blk['attn'].out_proj(attn_out)
+
+            if 'attn_ln' in blk:
+                attn_out = blk['attn_ln'](attn_out)
+            h = h + self.resid_drop(attn_out)
+            h = h + blk['mlp'](blk['ln2'](h))
+
+        return self.head(self.ln(h))
+
+
 # ---------------------------------------------------------------------------
 # §4  MODEL FACTORY
 # ---------------------------------------------------------------------------
@@ -720,8 +784,13 @@ def build_model(method: str, vocab: int, d: int, heads: int, layers: int,
         return MiniTransformer(**common, window=None, sub_ln=True)
     elif method == 'local':
         return MiniTransformer(**common, window=window, sub_ln=sub_ln)
+    elif method == 'local_rope':
+        return RoPETransformer(**common, window=window, sub_ln=sub_ln)
     elif method == 'xl':
-        return TransformerXL(**common, mem_len=seq_len)
+        # xl_mem_len: fixed cache size so XL doesn't gain context capacity as seq_len grows.
+        # Defaults to seq_len when running a single length; caller should pass base_seq for sweeps.
+        xl_mem_len = kwargs.get('xl_mem_len', seq_len)
+        return TransformerXL(**common, mem_len=xl_mem_len)
     elif method == 'linear':
         return LinearAttentionTransformer(**common, sub_ln=sub_ln)
     elif method == 'tensor':
@@ -757,13 +826,13 @@ def build_model(method: str, vocab: int, d: int, heads: int, layers: int,
 # ---------------------------------------------------------------------------
 
 def train_eval(
-    name: str, 
-    model: nn.Module, 
-    train_data: torch.Tensor, 
-    val_data: torch.Tensor, 
+    name: str,
+    model: nn.Module,
+    train_data: torch.Tensor,
+    val_data: torch.Tensor,
     device: torch.device,
-    seq_len: int, 
-    steps: int = 3000, 
+    seq_len: int,
+    steps: int = 3000,
     batch_size: int = 64,
     lr: float = 3e-4,
     log_interval: int = 500,
@@ -772,6 +841,7 @@ def train_eval(
     lr_schedule: str = "flat",
     wandb_log_every: int = 10,
     patience: int = 10,
+    use_amp: bool = False,
 ) -> Dict:
     """Train and evaluate a model with early stopping on validation PPL.
     
@@ -784,7 +854,13 @@ def train_eval(
     """
     model = model.to(device)
     n_params = count_parameters(model)
-    
+
+    _amp_on = use_amp and device.type == 'cuda'
+    amp_ctx = (
+        torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        if _amp_on else contextlib.nullcontext()
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     
     if lr_schedule == "cosine":
@@ -817,7 +893,8 @@ def train_eval(
     no_improve_count = 0
     t_start = time.time()
     
-    for step in range(1, steps + 1):
+    pbar = tqdm(range(1, steps + 1), desc=name, unit="step", dynamic_ncols=True) if TQDM_AVAILABLE else None
+    for step in (pbar if pbar is not None else range(1, steps + 1)):
         model.train()
         if is_xl:
             x, y = train_iter.next_batch()
@@ -825,16 +902,17 @@ def train_eval(
                 model.init_memory(batch_size, device)
         else:
             x, y = get_batch(train_data, batch_size, seq_len, device)
-        
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, vocab_out), y.view(-1))
-        
+
+        with amp_ctx:
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, vocab_out), y.view(-1))
+
         optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
         optimizer.step()
         scheduler.step()
-        
+
         train_loss = loss.item()
         train_losses.append(train_loss)
         
@@ -905,17 +983,26 @@ def train_eval(
             if hasattr(model, 'get_gates'):
                 g = model.get_gates()
                 gates_str = f" gates={sum(g)/len(g):.3f}"
-            
+
             elapsed = time.time() - t_start
-            print(f"  [{name}] step {step}/{steps}: val_ppl={val_ppl:.2f} "
-                  f"best={best_val_ppl:.2f}@{best_step}{gates_str} ({elapsed:.0f}s)")
-            
+            if pbar is not None:
+                postfix = {"val_ppl": f"{val_ppl:.2f}", "best": f"{best_val_ppl:.2f}@{best_step}"}
+                if gates_str:
+                    postfix["gates"] = f"{sum(g)/len(g):.3f}"
+                pbar.set_postfix(postfix)
+            else:
+                print(f"  [{name}] step {step}/{steps}: val_ppl={val_ppl:.2f} "
+                      f"best={best_val_ppl:.2f}@{best_step}{gates_str} ({elapsed:.0f}s)")
+
             # Early stopping
             if patience > 0 and no_improve_count >= patience:
                 print(f"  [{name}] Early stopping at step {step} "
                       f"(no improvement for {patience} evals, best@{best_step})")
                 break
     
+    if pbar is not None:
+        pbar.close()
+
     # Restore best checkpoint for final evaluation
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
@@ -1071,30 +1158,30 @@ def evaluate_full(
 # §7  MAIN EXPERIMENT RUNNER
 # ---------------------------------------------------------------------------
 
-ALL_METHODS = ['base', 'base_sln', 'local', 'xl', 'linear', 'tensor', 'tensor_sln', 'tensor_local']
+ALL_METHODS = ['base', 'base_sln', 'local', 'local_rope', 'xl', 'linear', 'tensor', 'tensor_sln', 'tensor_local']
 ALL_DATASETS = ['wikitext2', 'shakespeare']
 
 DATASET_DEFAULTS = {
     # Word-level, ~2M tokens, vocab ~30k
     'wikitext2': {
         'seq_lens':     [512],
-        'steps':        40000,
+        'steps':        10000,   # reduced from 40k; use --steps 40000 for full run
         'batch_size':   32,
         'd_model':      384,
         'heads':        8,
         'layers':       8,
-        'warmup_steps': 2000,
+        'warmup_steps': 1000,
         'dropout':      0.2,
     },
     # Char-level, ~5.4M chars (Folger complete works), vocab ~90
     'shakespeare': {
         'seq_lens':     [512],
-        'steps':        20000,
+        'steps':        10000,   # reduced from 20k; use --steps 20000 for full run
         'batch_size':   64,
         'd_model':      256,
         'heads':        8,
         'layers':       6,
-        'warmup_steps': 1000,
+        'warmup_steps': 500,
         'dropout':      0.1,
     },
 }
@@ -1116,44 +1203,68 @@ def run_experiment(args):
         print(f"{'#'*70}")
         
         train_data, val_data, test_data, vocab, level = load_dataset_by_name(ds_name, args.data_dir)
-        
+
+        if args.data_fraction < 1.0:
+            n = max(4096, int(len(train_data) * args.data_fraction))
+            train_data = train_data[:n]
+            print(f"  data_fraction={args.data_fraction:.0%}: using {len(train_data):,} train tokens")
+
         defaults = DATASET_DEFAULTS.get(ds_name, DATASET_DEFAULTS['wikitext2'])
         
         seq_lens = [int(x) for x in args.seq_lens.split(",")] if args.seq_lens else defaults['seq_lens']
         steps = args.steps or defaults['steps']
-        batch_size = args.batch or defaults['batch_size']
+        base_batch = args.batch or defaults['batch_size']
         d_model = args.d_model or defaults['d_model']
         heads = args.heads or defaults['heads']
         layers = args.layers or defaults['layers']
         window = args.window
         warmup_steps = args.warmup_steps if args.warmup_steps is not None else defaults.get('warmup_steps', 500)
         dropout = args.dropout if args.dropout is not None else defaults.get('dropout', 0.1)
-        
+
+        # Fairness invariants across seq_lens:
+        #   1. Constant token budget per step: batch_size × seq_len = base_batch × base_seq
+        #   2. Linear LR scaling: lr ∝ batch_size (linear scaling rule — keeps lr-per-sample fixed)
+        #   3. Fixed XL mem_len: XL cache size = base_seq throughout, so it doesn't gain
+        #      context capacity as seq_len grows (base_seq chosen = shortest seq in sweep).
+        base_seq = min(seq_lens)
+        tokens_per_batch = base_batch * base_seq
+        xl_mem_len = args.xl_mem_len if args.xl_mem_len else base_seq
+
         # Support comma-separated method list
         if args.method:
             methods = [m.strip() for m in args.method.split(",")]
         else:
             methods = ALL_METHODS
-        
+
         print(f"  Config: d={d_model}, heads={heads}, layers={layers}, "
-              f"batch={batch_size}, steps={steps}, schedule={args.schedule}, "
+              f"base_batch={base_batch} (tokens/batch={tokens_per_batch}), "
+              f"steps={steps}, schedule={args.schedule}, "
               f"warmup={warmup_steps}, dropout={dropout}")
         print(f"  Seq lengths: {seq_lens}")
         print(f"  Methods: {methods}")
-        
+
         ds_results = []
-        
-        for seq_len in seq_lens:
+
+        seq_lens_iter = tqdm(seq_lens, desc=f"{ds_name} seq_lens", unit="seq") if TQDM_AVAILABLE else seq_lens
+        for seq_len in seq_lens_iter:
+            # Scale batch size to maintain constant token budget; minimum 1
+            batch_size = max(1, tokens_per_batch // seq_len)
+            # Linear LR scaling: lr ∝ batch_size so lr-per-sample stays constant
+            effective_lr = args.lr * batch_size / base_batch
             print(f"\n{'='*60}")
-            print(f"  Sequence Length: {seq_len}, Window: {window}")
+            print(f"  Sequence Length: {seq_len}, Batch: {batch_size}, "
+                  f"LR: {effective_lr:.2e}, XL mem_len: {xl_mem_len}")
             print(f"{'='*60}")
             
             row = {
                 'dataset': ds_name, 'level': level, 'seq_len': seq_len,
-                'window': window, 'd_model': d_model, 'heads': heads, 'layers': layers,
+                'batch_size': batch_size, 'effective_lr': effective_lr,
+                'xl_mem_len': xl_mem_len, 'window': window,
+                'd_model': d_model, 'heads': heads, 'layers': layers,
             }
             
-            for method in methods:
+            methods_iter = tqdm(methods, desc=f"seq{seq_len} methods", unit="method", leave=False) if TQDM_AVAILABLE else methods
+            for method in methods_iter:
                 torch.manual_seed(args.seed)
                 if device.type == 'cuda':
                     torch.cuda.manual_seed(args.seed)
@@ -1165,7 +1276,8 @@ def run_experiment(args):
                         "dataset": ds_name, "method": method, "seq_len": seq_len,
                         "window": window, "d_model": d_model, "heads": heads,
                         "layers": layers, "batch_size": batch_size, "steps": steps,
-                        "lr": args.lr, "lr_schedule": args.schedule,
+                        "lr": effective_lr, "base_lr": args.lr, "lr_schedule": args.schedule,
+                        "xl_mem_len": xl_mem_len,
                         "warmup_steps": warmup_steps, "seed": args.seed,
                         "dropout": dropout,
                         "mem_channels": args.mem_channels,
@@ -1188,21 +1300,36 @@ def run_experiment(args):
                         mem_shape=tuple(args.mem_shape),
                         chunk_size=args.chunk_size,
                         num_latents=args.num_latents,
+                        xl_mem_len=xl_mem_len,
                     )
                     n_params = count_parameters(model)
-                    print(f"\n  --- {method} ({n_params:,} params) ---")
-                    
+                    # For Tensor variants, break out backbone vs memory params for transparency.
+                    extra_str = ""
+                    if hasattr(model, 'memory'):
+                        mem_params = count_parameters(model.memory)
+                        gate_params = sum(p.numel() for p in model.gates)
+                        ln_params = count_parameters(model.mem_lns)
+                        backbone_params = n_params - mem_params - gate_params - ln_params
+                        extra_str = (f" [backbone={backbone_params:,} "
+                                     f"+ mem={mem_params + gate_params + ln_params:,}]")
+                    print(f"\n  --- {method} ({n_params:,} params{extra_str}) ---")
+
                     if wandb_enabled():
                         wandb.config.update({"params": n_params}, allow_val_change=True)
-                    
+
+                    if getattr(args, 'compile', False):
+                        model = torch.compile(model)
+
                     result = train_eval(
                         method, model, train_data, val_data, device,
                         seq_len=seq_len, steps=steps, batch_size=batch_size,
-                        lr=args.lr, log_interval=args.log_interval,
+                        lr=effective_lr, log_interval=args.log_interval,
                         eval_batches=args.eval_batches,
                         warmup_steps=warmup_steps, lr_schedule=args.schedule,
                         patience=args.patience,
+                        use_amp=getattr(args, 'amp', False),
                     )
+                    result['lr'] = effective_lr
                     
                     # Test set evaluation on best checkpoint (already restored in train_eval)
                     test_result = evaluate_full(
@@ -1224,12 +1351,13 @@ def run_experiment(args):
                         log_benchmark_to_wandb(bench)
                     
                     row[method] = result
+                    save_run(result, ds_name, method, seq_len, args.outdir)
                     print(f"  ✓ {method}: val_PPL={result['final_ppl']:.2f} "
                           f"test_PPL={result['test_ppl']:.2f} "
                           f"BPC={result['bpc']:.3f} "
                           f"best@step{result['best_step']} "
                           f"params={result['params']:,}")
-                    
+
                 except Exception as e:
                     print(f"  ✗ {method} FAILED: {e}")
                     import traceback
@@ -1343,6 +1471,26 @@ def print_summary(all_results: Dict, methods: List[str]):
             print(line)
 
 
+def save_run(result: Dict, ds_name: str, method: str, seq_len: int, outdir: str):
+    """Save a single completed run immediately so progress survives interruption."""
+    os.makedirs(outdir, exist_ok=True)
+
+    def clean(obj):
+        if isinstance(obj, dict):
+            return {k: clean(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [clean(v) for v in obj]
+        elif isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return str(obj)
+            return round(obj, 4)
+        return obj
+
+    outfile = os.path.join(outdir, f"{ds_name}_{method}_seq{seq_len}.json")
+    with open(outfile, "w") as f:
+        json.dump(clean(result), f, indent=2)
+
+
 def save_results(all_results: Dict, outdir: str):
     """Save results to JSON."""
     os.makedirs(outdir, exist_ok=True)
@@ -1406,6 +1554,9 @@ Examples:
     parser.add_argument("--seq_lens", default=None,
                        help="Comma-separated sequence lengths")
     parser.add_argument("--window", type=int, default=64)
+    parser.add_argument("--xl_mem_len", type=int, default=None,
+                       help="Fixed XL cache size in tokens. Defaults to the shortest seq_len "
+                            "in the sweep so XL's effective context doesn't grow as seq_len increases.")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -1429,12 +1580,23 @@ Examples:
                        help="Number of latent tokens for V2-B (default: 64)")
     
     parser.add_argument("--log_interval", type=int, default=500)
-    parser.add_argument("--eval_batches", type=int, default=200)
+    parser.add_argument("--eval_batches", type=int, default=50,
+                       help="Batches per mid-training eval (default: 50). Full eval always runs at end.")
     parser.add_argument("--patience", type=int, default=10,
                        help="Early stopping patience (evals without improvement). 0=disabled.")
+    parser.add_argument("--amp", action="store_true",
+                       help="Enable bfloat16 automatic mixed precision (2-4x faster on Ampere+).")
+    parser.add_argument("--compile", action="store_true",
+                       help="Apply torch.compile to each model before training (~30s overhead, then faster).")
+    parser.add_argument("--quick", action="store_true",
+                       help="Shortcut for fast iteration: d=128, heads=4, layers=4, steps=5000. "
+                            "Individual flags still override.")
+    parser.add_argument("--data_fraction", type=float, default=1.0,
+                       help="Use only this fraction of training data (e.g. 0.1 for 10%%). "
+                            "Useful for quick ablations; val/test sets are always full.")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--outdir", default="./results")
-    
+
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="tensor-memory-lm")
     parser.add_argument("--wandb_entity", default=None)
@@ -1459,8 +1621,23 @@ Examples:
     print(f"  wandb:     {'ON → ' + args.wandb_project if args.wandb else 'OFF'}")
     print(f"  Time:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
+    # --quick: small model for fast iteration (individual flags still override)
+    if args.quick:
+        if args.d_model is None:
+            args.d_model = 128
+        if args.heads is None:
+            args.heads = 4
+        if args.layers is None:
+            args.layers = 4
+        if args.steps is None:
+            args.steps = 5000
+        print(f"  --quick: d={args.d_model}, heads={args.heads}, layers={args.layers}, steps={args.steps}")
+
     torch.manual_seed(args.seed)
-    
+    # TF32 is enabled by default on Ampere+ but be explicit for older PyTorch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     all_results = run_experiment(args)
     
     if args.method:
